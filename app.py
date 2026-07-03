@@ -68,10 +68,14 @@ SECTION_KEYWORDS = [
 BOLD_HINTS = ("bold", "black", "heavy", "semibold")  # "medium" se excluye a propósito:
 # en muchos PDFs se usa para bylines/autores, no para títulos de sección.
 
+PYMUPDF_BOLD_FLAG = 1 << 4  # bit "bold" en el campo `flags` de cada span de PyMuPDF
 
-def _is_bold_font(fontname: str) -> bool:
+
+def _is_bold_font(fontname: str, flags: int) -> bool:
     f = (fontname or "").lower()
-    return any(h in f for h in BOLD_HINTS)
+    if any(h in f for h in BOLD_HINTS):
+        return True
+    return bool(flags & PYMUPDF_BOLD_FLAG)
 
 
 def extract_styled_lines(pdf_bytes: bytes):
@@ -99,7 +103,7 @@ def extract_styled_lines(pdf_bytes: bytes):
                         "page": pno,
                         "text": text,
                         "size": round(main_span.get("size", 0), 1),
-                        "bold": _is_bold_font(main_span.get("font", "")),
+                        "bold": _is_bold_font(main_span.get("font", ""), main_span.get("flags", 0)),
                     }
                 )
     meta_title = (doc.metadata.get("title") or "").strip()
@@ -135,8 +139,9 @@ def _body_font_size(lines):
 def parse_sections_by_style(pdf_bytes: bytes):
     """Segmenta el PDF en secciones usando el tamaño/negrita de la fuente.
 
-    Devuelve (preamble, sections, meta_title) o None si no logra detectar
-    encabezados confiables (para que el llamador use el método de respaldo).
+    Devuelve (preamble, sections, meta_title, debug_info) o None si no logra
+    detectar encabezados confiables (para que el llamador use el método de
+    respaldo). `debug_info` sirve para mostrar en la interfaz qué se detectó.
     """
     lines, meta_title, total_pages = extract_styled_lines(pdf_bytes)
     if not lines:
@@ -146,10 +151,15 @@ def parse_sections_by_style(pdf_bytes: bytes):
     body_size = _body_font_size(clean)
 
     def is_heading_line(l):
-        return l["bold"] and l["size"] >= body_size + 1 and len(l["text"]) < 150
+        if len(l["text"]) >= 150:
+            return False
+        bold_and_bigger = l["bold"] and l["size"] >= body_size + 1
+        # Señal de respaldo: salto de tamaño notorio aunque no se detecte negrita
+        # (acotado por arriba para no capturar títulos de portada, mucho más grandes).
+        size_jump_only = body_size + 2 <= l["size"] <= body_size + 12
+        return bold_and_bigger or size_jump_only
 
     # Agrupar líneas de encabezado consecutivas (títulos que ocupan 2+ líneas)
-    heading_positions = []  # índices en `clean` que son inicio de un encabezado (posiblemente fusionado)
     merged_headings = []  # (idx_inicio, texto_encabezado_completo)
     i = 0
     while i < len(clean):
@@ -165,8 +175,16 @@ def parse_sections_by_style(pdf_bytes: bytes):
         else:
             i += 1
 
+    debug_info = {
+        "metodo": "estilo (tamaño/negrita de fuente)",
+        "body_size": body_size,
+        "n_lineas": len(clean),
+        "n_encabezados": len(merged_headings),
+        "encabezados": [h for _, h in merged_headings],
+    }
+
     if len(merged_headings) < 2:
-        return None  # señal insuficiente: usar método de respaldo
+        return None, debug_info  # señal insuficiente: usar método de respaldo
 
     preamble_lines = clean[: merged_headings[0][0]]
     preamble = "\n".join(l["text"] for l in preamble_lines).strip()
@@ -187,9 +205,9 @@ def parse_sections_by_style(pdf_bytes: bytes):
             sections.append({"heading": heading.strip(), "text": content})
 
     if not sections:
-        return None
+        return None, debug_info
 
-    return preamble, sections, meta_title
+    return (preamble, sections, meta_title), debug_info
 
 
 # --- Método de respaldo (palabras clave), para PDFs sin estilo aprovechable ---
@@ -224,8 +242,14 @@ def parse_sections_by_keywords(pdf_bytes: bytes):
     lines = full_text.split("\n")
     headings_idx = [(i, h) for i, l in enumerate(lines) if (h := _match_heading_keyword(l))]
 
+    debug_info = {
+        "metodo": "palabras clave (respaldo)",
+        "n_encabezados": len(headings_idx),
+        "encabezados": [h for _, h in headings_idx],
+    }
+
     if not headings_idx:
-        return "", [{"heading": "Contenido completo", "text": full_text.strip()}], meta_title
+        return "", [{"heading": "Contenido completo", "text": full_text.strip()}], meta_title, debug_info
 
     preamble = "\n".join(lines[: headings_idx[0][0]]).strip()
     sections = []
@@ -237,19 +261,28 @@ def parse_sections_by_keywords(pdf_bytes: bytes):
             sections.append({"heading": heading, "text": content})
 
     if not sections:
-        return preamble, [{"heading": "Contenido completo", "text": full_text.strip()}], meta_title
+        return preamble, [{"heading": "Contenido completo", "text": full_text.strip()}], meta_title, debug_info
 
-    return preamble, sections, meta_title
+    return preamble, sections, meta_title, debug_info
 
 
 def extract_and_segment(pdf_bytes: bytes):
     """Punto de entrada único: intenta el método por estilo y, si no es
-    confiable, recurre al método por palabras clave."""
-    result = parse_sections_by_style(pdf_bytes)
+    confiable, recurre al método por palabras clave.
+
+    Devuelve (preamble, sections, meta_title, debug_info).
+    """
+    result, debug_info = parse_sections_by_style(pdf_bytes)
     if result is not None:
         preamble, sections, meta_title = result
-        return preamble, sections, meta_title
-    return parse_sections_by_keywords(pdf_bytes)
+        return preamble, sections, meta_title, debug_info
+    preamble, sections, meta_title, debug_info_fallback = parse_sections_by_keywords(pdf_bytes)
+    debug_info_fallback["motivo_respaldo"] = (
+        f"El método por estilo solo encontró {debug_info.get('n_encabezados', 0)} "
+        f"encabezado(s) confiables (se requieren al menos 2)."
+    )
+    debug_info_fallback["debug_estilo"] = debug_info
+    return preamble, sections, meta_title, debug_info_fallback
 
 
 def extract_title(preamble: str, meta_title: str) -> str:
@@ -404,7 +437,20 @@ if uploaded_file and st.button("📄 Procesar artículo", type="primary"):
 
     with st.spinner("Extrayendo texto del PDF..."):
         pdf_bytes = uploaded_file.read()
-        preamble, raw_sections, meta_title = extract_and_segment(pdf_bytes)
+        preamble, raw_sections, meta_title, debug_info = extract_and_segment(pdf_bytes)
+
+    with st.expander("🔍 Diagnóstico de detección de secciones", expanded=False):
+        st.write(f"**Método usado:** {debug_info.get('metodo')}")
+        if "body_size" in debug_info:
+            st.write(f"**Tamaño de fuente del cuerpo detectado:** {debug_info['body_size']} pt")
+        st.write(f"**Encabezados detectados:** {debug_info.get('n_encabezados', 0)}")
+        if debug_info.get("encabezados"):
+            st.write(debug_info["encabezados"])
+        if "motivo_respaldo" in debug_info:
+            st.warning(debug_info["motivo_respaldo"])
+            if debug_info.get("debug_estilo", {}).get("encabezados"):
+                st.write("Candidatos que sí detectó el método por estilo (pero fueron menos de 2):")
+                st.write(debug_info["debug_estilo"]["encabezados"])
 
     sample = (preamble + " " + " ".join(s["text"] for s in raw_sections))[:1000]
     try:
